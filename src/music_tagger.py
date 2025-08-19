@@ -4,7 +4,7 @@ import asyncio
 import nest_asyncio
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 import musicbrainzngs
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
@@ -17,15 +17,12 @@ import aiohttp
 import json
 from concurrent.futures import ThreadPoolExecutor
 
-from .config import Config
-from .music_metadata import MusicMetadata
-from .music_sources import (
-    MusicSource,
-    NeteaseMusicSource,
-    QQMusicSource,
-    MusicBrainzSource,
-    SpotifySource
-)
+from music_metadata import MusicMetadata
+from music_sources.base import MusicSource
+from music_sources.netease import NeteaseMusicSource
+from music_sources.qq import QQMusicSource
+from music_sources.musicbrainz import MusicBrainzSource
+from music_sources.spotify import SpotifySource
 
 # 启用嵌套异步循环支持
 nest_asyncio.apply()
@@ -34,12 +31,11 @@ nest_asyncio.apply()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# 配置日志
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-from .config import Config
-from .cache import Cache
+from config import Config
+from cache import Cache
+from media_cache import MediaCache
+from constants import MUSIC_EXTENSIONS
+from file_manager import FileTracker, LibraryOrganizer
 
 class MusicTagger:
     def __init__(self, config_path: str = None):
@@ -49,6 +45,12 @@ class MusicTagger:
         self.session = None
         self.executor = ThreadPoolExecutor(max_workers=4)
         self.cache = Cache()
+        self.media_cache = MediaCache()
+        self.file_tracker = FileTracker()
+        self.library_organizer = LibraryOrganizer(
+            library_root=".",  # 默认使用当前目录
+            format_pattern=self.config.get('global.library_format', "{artist}/{album}/{title}")
+        )
     
     def _initialize_sources(self) -> List[MusicSource]:
         """初始化已启用的数据源"""
@@ -74,28 +76,33 @@ class MusicTagger:
                     client_secret=spotify_config['client_secret']
                 )
                 sources.append(source)
-            else:
-                logger.warning("Spotify 配置不完整，已禁用 Spotify 数据源")
         
         # 初始化网易云音乐数据源
         if self.config.is_source_enabled('netease'):
             netease_config = self.config.get_source_config('netease')
-            source = NeteaseMusicSource(
-                api_key=netease_config.get('api_key'),
-                api_secret=netease_config.get('api_secret'),
-                weight=netease_config.get('weight', 1.0)
-            )
-            sources.append(source)
+            if netease_config.get('api_key') and netease_config.get('api_secret'):
+                source = NeteaseMusicSource(
+                    api_key=netease_config.get('api_key'),
+                    api_secret=netease_config.get('api_secret'),
+                    weight=netease_config.get('weight', 1.0)
+                )
+                sources.append(source)
         
         # 初始化 QQ 音乐数据源
         if self.config.is_source_enabled('qqmusic'):
             qq_config = self.config.get_source_config('qqmusic')
-            source = QQMusicSource(
-                api_key=qq_config.get('api_key'),
-                weight=qq_config.get('weight', 1.0)
-            )
-            sources.append(source)
+            if qq_config.get('api_key'):
+                source = QQMusicSource(
+                    api_key=qq_config.get('api_key'),
+                    weight=qq_config.get('weight', 1.0)
+                )
+                sources.append(source)
         
+        if not sources:
+            logger.warning("警告：没有可用的数据源！请检查配置文件并启用至少一个数据源。")
+        else:
+            logger.info(f"已启用的数据源: {', '.join(source.__class__.__name__ for source in sources)}")
+            
         return sources
         
     async def initialize(self):
@@ -248,53 +255,96 @@ class MusicTagger:
         # 返回得分最高的结果
         return max(results, key=lambda x: getattr(x, 'weighted_score', 0))
 
-    async def download_cover_art(self, metadata: MusicMetadata) -> Optional[bytes]:
-        """下载专辑封面，带重试机制"""
-        max_retries = 3
-        retry_delay = 1  # 秒
-        
-        for attempt in range(max_retries):
-            try:
-                if metadata.cover_url:
-                    async with self.session.get(metadata.cover_url) as response:
-                        if response.status == 200:
-                            return await response.read()
-                elif metadata.release_id:
-                    # 检查缓存
-                    cache_key = f"cover_{metadata.release_id}"
-                    cached_cover = self.cache.get(cache_key)
-                    if cached_cover and "url" in cached_cover:
-                        async with self.session.get(cached_cover["url"]) as response:
-                            if response.status == 200:
-                                return await response.read()
-                    
-                    # 如果缓存不存在或失效，重新获取
-                    cover_art = musicbrainzngs.get_image_list(metadata.release_id)
-                    if cover_art and 'images' in cover_art:
-                        image_url = cover_art['images'][0]['image']
-                        # 缓存封面URL
-                        self.cache.set(cache_key, {"url": image_url})
-                        async with self.session.get(image_url) as response:
-                            if response.status == 200:
-                                return await response.read()
-                            
-            except aiohttp.ClientError as e:
-                if attempt < max_retries - 1:
-                    delay = retry_delay * (attempt + 1)
-                    logger.warning(f"下载封面失败 (尝试 {attempt + 1}/{max_retries}): {str(e)}")
-                    await asyncio.sleep(delay)
+    async def download_cover_art(self, metadata: MusicMetadata, quality: str = "high") -> Optional[bytes]:
+        """从多个数据源下载专辑封面，支持质量选择和本地缓存"""
+        try:
+            # 首先检查本地缓存
+            cached_cover = await self.media_cache.get_cover(
+                artist=metadata.artist,
+                title=metadata.title,
+                album=metadata.album,
+                quality=quality
+            )
+            if cached_cover:
+                logger.info("使用缓存的封面图片")
+                return cached_cover
+
+            # 从各个数据源获取封面
+            for source in self.sources:
+                try:
+                    cover_data = await source.get_album_cover(metadata, quality)
+                    if cover_data and cover_data.get("data"):
+                        # 保存到缓存
+                        await self.media_cache.save_cover(
+                            artist=metadata.artist,
+                            title=metadata.title,
+                            album=metadata.album,
+                            data=cover_data["data"],
+                            source=source.__class__.__name__.lower(),
+                            quality=quality
+                        )
+                        logger.info(f"成功从 {source.__class__.__name__} 获取封面")
+                        return cover_data["data"]
+                except Exception as e:
+                    logger.warning(f"从 {source.__class__.__name__} 获取封面失败: {str(e)}")
                     continue
-                else:
-                    logger.error(f"下载封面失败，已达最大重试次数: {str(e)}")
-            except Exception as e:
-                logger.error(f"下载封面时出错: {str(e)}")
-                break
+
+            logger.warning("无法从任何数据源获取封面")
+            return None
+
+        except Exception as e:
+            logger.error(f"下载封面时出错: {str(e)}")
+            return None
+            
+    async def get_lyrics(self, metadata: MusicMetadata) -> Optional[str]:
+        """获取歌词，支持多数据源和本地缓存"""
+        try:
+            # 首先检查本地缓存
+            cached_lyrics = await self.media_cache.get_lyrics(
+                artist=metadata.artist,
+                title=metadata.title
+            )
+            if cached_lyrics:
+                logger.info("使用缓存的歌词")
+                return cached_lyrics
+
+            # 从各个数据源获取歌词
+            for source in self.sources:
+                try:
+                    lyrics_data = await source.get_lyrics(metadata)
+                    if lyrics_data and lyrics_data.get("text"):
+                        # 保存到缓存
+                        await self.media_cache.save_lyrics(
+                            artist=metadata.artist,
+                            title=metadata.title,
+                            lyrics=lyrics_data["text"],
+                            source=source.__class__.__name__.lower(),
+                            language=lyrics_data.get("language", "unknown")
+                        )
+                        logger.info(f"成功从 {source.__class__.__name__} 获取歌词")
+                        return lyrics_data["text"]
+                except Exception as e:
+                    logger.warning(f"从 {source.__class__.__name__} 获取歌词失败: {str(e)}")
+                    continue
+
+            logger.warning("无法从任何数据源获取歌词")
+            return None
+
+        except Exception as e:
+            logger.error(f"获取歌词时出错: {str(e)}")
+            return None
                 
         return None
 
     async def process_file(self, file_path: str) -> bool:
         """处理单个音乐文件"""
         try:
+            # 检查文件是否需要处理
+            file_hash = await self.file_tracker._calculate_file_hash(file_path)
+            if self.config.get('global.skip_scraped', True) and self.file_tracker.is_file_tracked(file_path, file_hash):
+                logger.info(f"跳过已处理的文件: {file_path}")
+                return True
+
             # 获取文件名作为搜索依据
             filename = Path(file_path).stem
             artist, title = self.parse_filename(filename)
@@ -306,11 +356,15 @@ class MusicTagger:
                 return False
 
             # 根据配置决定是否需要用户确认
-            if self.config.require_confirmation:
+            if self.config.get('global.require_confirmation', False):
                 print(f"\n找到匹配: {metadata}")
                 response = input("是否接受这个匹配? [Y/n] ").lower()
                 if response and response != 'y':
                     return False
+
+            # 获取封面和歌词
+            cover_data = await self.download_cover_art(metadata)
+            lyrics = await self.get_lyrics(metadata)
 
             # 根据文件类型处理
             if file_path.lower().endswith('.flac'):
@@ -320,9 +374,11 @@ class MusicTagger:
                 audio['TITLE'] = metadata.title
                 audio['ARTIST'] = metadata.artist
                 audio['ALBUM'] = metadata.album
+                
+                if lyrics:
+                    audio['LYRICS'] = lyrics
 
-                # 下载并添加封面
-                cover_data = await self.download_cover_art(metadata)
+                # 添加封面
                 if cover_data:
                     image = Picture()
                     image.type = 3  # 封面图片
@@ -346,9 +402,39 @@ class MusicTagger:
                 audio['title'] = metadata.title
                 audio['artist'] = metadata.artist
                 audio['album'] = metadata.album
+                
+                # 添加歌词
+                if lyrics:
+                    try:
+                        audio['lyrics'] = lyrics
+                    except Exception as e:
+                        logger.warning(f"添加歌词失败: {str(e)}")
 
             # 保存更改
             audio.save()
+            
+            # 记录文件状态
+            self.file_tracker.track_file(file_path, file_hash, {
+                'artist': metadata.artist,
+                'album': metadata.album,
+                'title': metadata.title
+            })
+
+            # 如果启用了文件夹整理功能
+            if self.config.get('global.organize_library', False):
+                src_path = Path(file_path)
+                new_path = await self.library_organizer.organize_file(
+                    src_path,
+                    {
+                        'artist': metadata.artist,
+                        'album': metadata.album,
+                        'title': metadata.title
+                    }
+                )
+                if new_path:
+                    logger.info(f"文件已移动到: {new_path}")
+                    return True
+                
             logger.info(f"成功更新文件: {file_path}")
             return True
 
@@ -356,17 +442,27 @@ class MusicTagger:
             logger.error(f"处理文件时出错 {file_path}: {str(e)}")
             return False
 
+    def _find_music_files(self, directory: Path) -> Set[str]:
+        """递归查找所有音乐文件"""
+        music_files = set()
+        for ext in MUSIC_EXTENSIONS:
+            music_files.update(str(p) for p in directory.rglob(f"*{ext}"))
+        return music_files
+
     async def process_directory(self, directory_path: str):
         """处理整个目录的音乐文件"""
         await self.initialize()
         try:
             directory = Path(directory_path)
-            music_files = list(directory.glob('*.mp3')) + list(directory.glob('*.m4a')) + list(directory.glob('*.flac'))
+            music_files = self._find_music_files(directory)
+            
+            # 清理不存在的文件记录
+            self.file_tracker.remove_missing_files(music_files)
             
             logger.info(f"找到 {len(music_files)} 个音乐文件")
             
             # 使用异步进度条
-            for file_path in tqdm(music_files, desc="处理音乐文件"):
+            for file_path in tqdm(sorted(music_files), desc="处理音乐文件"):
                 await self.process_file(str(file_path))
         finally:
             await self.close()

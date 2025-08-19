@@ -1,33 +1,73 @@
 global:
-  min_confidence: 50
-  require_confirmation: true
-  search_timeout: 30
+  # 基本设置
+  min_confidence: 50  # 最低匹配置信度
+  require_confirmation: true  # 是否需要用户确认
+  search_timeout: 30  # 搜索超时时间（秒）
+  
+  # 数据源权重配置
   source_weights:
     musicbrainz: 1.0
     spotify: 1.0
     netease: 0.8
     qqmusic: 0.8
+    
+  # 封面图片设置
+  cover_quality: high  # 首选封面质量 (low/medium/high)
+  cover_fallback: true  # 当首选质量不可用时是否尝试其他质量
+  prefer_source_cover: null  # 首选数据源的封面（留空则自动选择最佳质量）
+  
+  # 歌词设置
+  lyrics_language: zh-CN  # 首选歌词语言
+  prefer_translated: true  # 是否优先使用翻译版本（如果有）
+  
+  # 缓存设置
+  cache_dir: .cache  # 缓存目录
+  cache_expiry: 30  # 缓存过期天数
+  
+  # 错误处理
+  max_retries: 3  # 最大重试次数
+  retry_delay: 1  # 重试延迟（秒）
 
+# MusicBrainz 配置
 musicbrainz:
-  enabled: true
-  app_name: YourAppName
-  version: "1.0"
-  contact: your@email.com
-  weight: 1.0
+  enabled: true  # 是否启用
+  app_name: "YourAppName"  # 应用名称
+  version: "1.0"  # 应用版本
+  contact: "your@email.com"  # 联系邮箱
+  weight: 1.0  # 数据源权重
+  
+  # 高级设置
+  rate_limit: 1  # 请求间隔（秒）
+  prefer_release_type: "Album"  # 首选发行类型
 
+# Spotify 配置
 spotify:
-  enabled: false
-  client_id: "your_client_id"
-  client_secret: "your_client_secret"
-  weight: 1.0
+  enabled: false  # 是否启用
+  client_id: "your_client_id"  # 客户端ID
+  client_secret: "your_client_secret"  # 客户端密钥
+  weight: 1.0  # 数据源权重
+  
+  # 高级设置
+  market: "US"  # 市场区域
+  include_external: "audio"  # 包含外部音频
 
+# 网易云音乐配置
 netease:
-  enabled: false
-  api_key: "your_api_key"
-  api_secret: "your_api_secret"
-  weight: 0.8
+  enabled: false  # 是否启用
+  api_key: "your_api_key"  # API密钥
+  api_secret: "your_api_secret"  # API密钥
+  weight: 0.8  # 数据源权重
+  
+  # 高级设置
+  use_higher_quality: true  # 是否使用更高质量的资源
+  include_user_data: false  # 是否包含用户数据
 
+# QQ音乐配置
 qqmusic:
-  enabled: false
-  api_key: "your_api_key"
-  weight: 0.8
+  enabled: false  # 是否启用
+  api_key: "your_api_key"  # API密钥
+  weight: 0.8  # 数据源权重
+  
+  # 高级设置
+  search_type: "qq"  # 搜索类型（qq/wx）
+  include_mv: false  # 是否包含MV信息
