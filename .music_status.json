@@ -1,1 +1,24 @@
-{}
+{
+  "/Users/wzq/Downloads/music/0053-爱我中华-宋祖英.wav": {
+    "mtime": 1755681233.8535058,
+    "size": 45430854,
+    "processed_at": "2025-08-20T17:13:53.866180",
+    "metadata": {
+      "title": "爱我中华",
+      "artist": "宋祖英",
+      "album": "好日子",
+      "source": "spotify"
+    }
+  },
+  "/Users/wzq/Downloads/music/0016-爱得太多-王杰.wav": {
+    "mtime": 1755681235.289633,
+    "size": 52091311,
+    "processed_at": "2025-08-20T17:13:55.304963",
+    "metadata": {
+      "title": "爱得太多 - Live",
+      "artist": "王杰",
+      "album": "金曲捞 第9期 (Live)",
+      "source": "spotify"
+    }
+  }
+}

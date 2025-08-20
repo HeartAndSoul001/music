@@ -4,6 +4,25 @@
 global:
   min_confidence: 50  # 最小置信度阈值，低于此值的匹配将被忽略
   require_confirmation: true  # 是否需要用户确认匹配结果
+  text_format: "simplified"  # 文字格式：simplified（简体中文）或 traditional（繁体中文）
+  source_weights:  # 数据源权重配置
+    musicbrainz: 0.8
+    spotify: 1.2  # 增加 Spotify 的权重使其优先级更高
+    netease: 0.8
+    qqmusic: 0.8
+  directory_structure:
+    pattern: "{artist}/{year} - {album}/{track_number}. {title}"  # 目录结构模式
+    merge_albums: true  # 是否合并相同专辑的不同版本
+    merge_rules:  # 专辑合并规则
+      ignore_suffixes:  # 忽略这些后缀以判断是否为相同专辑
+        - "Special Edition"
+        - "Deluxe Edition"
+        - "Remastered"
+        - "Live"
+      # 如果专辑名称相似度超过此值，认为是同一张专辑
+      similar_threshold: 85  # 相似度阈值（0-100）
+    use_pinyin: false  # 是否使用拼音作为目录名
+    normalize_names: true  # 是否规范化文件名（移除特殊字符等）
 
 # MusicBrainz 数据源设置
 musicbrainz:
@@ -15,9 +34,9 @@ musicbrainz:
 
 # Spotify 数据源设置
 spotify:
-  enabled: false  # 是否启用 Spotify 数据源
-  client_id: ""  # Spotify API Client ID
-  client_secret: ""  # Spotify API Client Secret
+  enabled: true  # 是否启用 Spotify 数据源
+  client_id: "cbd5267e548f47398c59477ce23f0c2c"  # Spotify API Client ID
+  client_secret: "1ba2ad5aa36148e3a79a4e69187d483d"  # Spotify API Client Secret
   weight: 1.0  # 搜索结果权重
 
 # 网易云音乐数据源设置
@@ -38,3 +57,21 @@ qqmusic:
   # 可选设置
   use_cache: true        # 是否缓存搜索结果
   cache_timeout: 86400   # 缓存超时时间（秒）
+
+# 目录设置
+directories:
+  source: "/Users/wzq/Downloads/music"    # 原始音乐文件目录
+  target: "/Users/wzq/Documents/workspace/music/music_library"    # 整理后的目标目录
+  directory_pattern: "{artist}/{year} - {album}/{track_number}. {title}"  # 目录结构模式
+
+# 封面设置
+cover_art:
+  save_to_directory: true    # 是否将封面保存到专辑目录
+  filename: "cover"    # 封面文件名（不含扩展名）
+  preferred_format: "jpg"    # 首选格式：jpg 或 png
+  quality: "high"    # 图片质量：high、medium 或 low
+  additional_sources:  # 备用数据源列表
+    - "QQ音乐"
+    - "网易云音乐"
+    - "酷我音乐"
+    - "酷狗音乐"

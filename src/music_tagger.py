@@ -1,4 +1,5 @@
 import os
+import sys
 import logging
 import asyncio
 import nest_asyncio
@@ -25,6 +26,7 @@ from music_sources.netease import NeteaseMusicSource
 from music_sources.qq import QQMusicSource
 from music_sources.musicbrainz import MusicBrainzSource
 from music_sources.spotify import SpotifySource
+from text_converter import TextConverter
 
 # 启用嵌套异步循环支持
 nest_asyncio.apply()
@@ -47,11 +49,21 @@ class MusicTagger:
         self.cache = Cache()
         self.media_cache = MediaCache()
         self.file_status = FileStatus()
+        
+        # 创建文字转换器
+        text_format = self.config.get("global.text_format", "simplified")
+        if text_format == "traditional":
+            self.text_converter = TextConverter("s2t")  # 简体转繁体
+        else:
+            self.text_converter = TextConverter("t2s")  # 繁体转简体
     
     def _initialize_sources(self) -> List[MusicSource]:
         """初始化已启用的数据源"""
         sources = []
         enabled_sources = self.config.get_enabled_sources()
+        
+        # 获取全局源权重配置
+        source_weights = self.config.get("global.source_weights", {})
         
         # 初始化 MusicBrainz 数据源
         if self.config.is_source_enabled('musicbrainz'):
@@ -60,7 +72,8 @@ class MusicTagger:
                 source = MusicBrainzSource(
                     app_name=mb_config['app_name'],
                     version=mb_config.get('version', '1.0'),
-                    contact=mb_config['contact']
+                    contact=mb_config['contact'],
+                    weight=source_weights.get('musicbrainz', 1.0)  # 使用全局权重
                 )
                 sources.append(source)
                 logger.info("MusicBrainz 数据源已启用")
@@ -73,7 +86,8 @@ class MusicTagger:
             if spotify_config.get('client_id') and spotify_config.get('client_secret'):
                 source = SpotifySource(
                     client_id=spotify_config['client_id'],
-                    client_secret=spotify_config['client_secret']
+                    client_secret=spotify_config['client_secret'],
+                    weight=source_weights.get('spotify', 1.0)  # 使用全局权重
                 )
                 sources.append(source)
                 logger.info("Spotify 数据源已启用")
@@ -87,7 +101,7 @@ class MusicTagger:
                 source = NeteaseMusicSource(
                     api_key=netease_config['api_key'],
                     api_secret=netease_config['api_secret'],
-                    weight=netease_config.get('weight', 1.0)
+                    weight=source_weights.get('netease', 1.0)  # 使用全局权重
                 )
                 sources.append(source)
                 logger.info("网易云音乐数据源已启用")
@@ -100,7 +114,7 @@ class MusicTagger:
             if qq_config.get('api_key'):
                 source = QQMusicSource(
                     api_key=qq_config['api_key'],
-                    weight=qq_config.get('weight', 1.0)
+                    weight=source_weights.get('qqmusic', 1.0)  # 使用全局权重
                 )
                 sources.append(source)
                 logger.info("QQ音乐数据源已启用")
@@ -125,12 +139,14 @@ class MusicTagger:
 
     def parse_filename(self, filename: str) -> Tuple[str, str]:
         """从文件名解析艺术家和标题信息"""
-        # 移除序号
-        filename = re.sub(r'^\d+\.\s*', '', filename)
+        # 移除序号前缀（如 "0013-"）
+        filename = re.sub(r'^\d+-', '', filename)
+        # 移除扩展名
+        filename = os.path.splitext(filename)[0]
         # 尝试分割艺术家和标题
-        parts = filename.split(' - ', 1)
+        parts = filename.split('-', 1)
         if len(parts) == 2:
-            return parts[0].strip(), parts[1].strip()
+            return parts[1].strip(), parts[0].strip()
         return None, filename.strip()
 
     def _create_cache_key(self, title: str, artist: str = None) -> str:
@@ -262,9 +278,14 @@ class MusicTagger:
         # 返回得分最高的结果
         return max(results, key=lambda x: getattr(x, 'weighted_score', 0))
 
-    async def download_cover_art(self, metadata: MusicMetadata, quality: str = "high") -> Optional[bytes]:
+    async def download_cover_art(self, metadata: MusicMetadata, quality: str = None) -> Optional[bytes]:
         """从多个数据源下载专辑封面，支持质量选择和本地缓存"""
         try:
+            # 获取配置
+            quality = quality or self.config.get("cover_art.quality", "high")
+            save_to_directory = self.config.get("cover_art.save_to_directory", True)
+            preferred_format = self.config.get("cover_art.preferred_format", "jpg")
+            
             # 首先检查本地缓存
             cached_cover = await self.media_cache.get_cover(
                 artist=metadata.artist,
@@ -274,34 +295,102 @@ class MusicTagger:
             )
             if cached_cover:
                 logger.info("使用缓存的封面图片")
+                if save_to_directory:
+                    await self._save_cover_to_directory(metadata, cached_cover, preferred_format)
                 return cached_cover
 
-            # 从各个数据源获取封面
-            for source in self.sources:
-                try:
-                    cover_data = await source.get_album_cover(metadata, quality)
-                    if cover_data and cover_data.get("data"):
-                        # 保存到缓存
-                        await self.media_cache.save_cover(
-                            artist=metadata.artist,
-                            title=metadata.title,
-                            album=metadata.album,
-                            data=cover_data["data"],
-                            source=source.__class__.__name__.lower(),
-                            quality=quality
-                        )
-                        logger.info(f"成功从 {source.__class__.__name__} 获取封面")
-                        return cover_data["data"]
-                except Exception as e:
-                    logger.warning(f"从 {source.__class__.__name__} 获取封面失败: {str(e)}")
-                    continue
-
+            # 尝试从主要数据源获取封面
+            cover_data = await self._try_get_cover_from_sources(self.sources, metadata, quality)
+            
+            # 如果主要数据源都失败了，尝试备用数据源
+            if not cover_data:
+                additional_sources = self.config.get("cover_art.additional_sources", [])
+                for source_name in additional_sources:
+                    try:
+                        source = self._get_additional_source(source_name)
+                        if source:
+                            cover_data = await source.get_album_cover(metadata, quality)
+                            if cover_data and cover_data.get("data"):
+                                break
+                    except Exception as e:
+                        logger.warning(f"从备用数据源 {source_name} 获取封面失败: {str(e)}")
+            
+            if cover_data and cover_data.get("data"):
+                # 保存到缓存
+                await self.media_cache.save_cover(
+                    artist=metadata.artist,
+                    title=metadata.title,
+                    album=metadata.album,
+                    data=cover_data["data"],
+                    source=cover_data.get("source", "unknown"),
+                    quality=quality
+                )
+                
+                # 如果配置了保存到目录，则保存
+                if save_to_directory:
+                    await self._save_cover_to_directory(metadata, cover_data["data"], preferred_format)
+                
+                return cover_data["data"]
+            
             logger.warning("无法从任何数据源获取封面")
             return None
 
         except Exception as e:
             logger.error(f"下载封面时出错: {str(e)}")
             return None
+
+    async def _try_get_cover_from_sources(self, sources, metadata: MusicMetadata, quality: str) -> Optional[Dict]:
+        """从多个数据源尝试获取封面"""
+        for source in sources:
+            try:
+                cover_data = await source.get_album_cover(metadata, quality)
+                if cover_data and cover_data.get("data"):
+                    logger.info(f"成功从 {source.__class__.__name__} 获取封面")
+                    return cover_data
+            except Exception as e:
+                logger.warning(f"从 {source.__class__.__name__} 获取封面失败: {str(e)}")
+        return None
+
+    def _get_additional_source(self, source_name: str) -> Optional[MusicSource]:
+        """获取额外的音乐数据源实例"""
+        # 这里可以根据需要添加更多的数据源
+        sources = {
+            "QQ音乐": QQMusicSource,
+            "网易云音乐": NeteaseMusicSource,
+            # 可以添加更多数据源
+        }
+        source_class = sources.get(source_name)
+        if source_class:
+            try:
+                # 获取对应的配置
+                config = self.config.get_source_config(source_name.lower().replace("音乐", ""))
+                if config:
+                    return source_class(**config)
+            except Exception as e:
+                logger.warning(f"创建数据源 {source_name} 失败: {str(e)}")
+        return None
+
+    async def _save_cover_to_directory(self, metadata: MusicMetadata, cover_data: bytes, format: str = "jpg") -> None:
+        """将封面保存到专辑目录"""
+        try:
+            # 构建目标目录路径
+            target_dir = Path(self.config.get("directories.target"))
+            album_dir = target_dir / self._clean_name(metadata.artist) / self._clean_name(metadata.album)
+            
+            # 确保目录存在
+            album_dir.mkdir(parents=True, exist_ok=True)
+            
+            # 确定文件名
+            cover_filename = self.config.get("cover_art.filename", "cover")
+            cover_path = album_dir / f"{cover_filename}.{format.lower()}"
+            
+            # 保存封面文件
+            with open(cover_path, "wb") as f:
+                f.write(cover_data)
+            logger.info(f"封面已保存到: {cover_path}")
+            
+        except Exception as e:
+            logger.error(f"保存封面到目录失败: {str(e)}")
             
     async def get_lyrics(self, metadata: MusicMetadata) -> Optional[str]:
         """获取歌词，支持多数据源和本地缓存"""
@@ -313,23 +402,27 @@ class MusicTagger:
             )
             if cached_lyrics:
                 logger.info("使用缓存的歌词")
-                return cached_lyrics
+                # 进行文字转换
+                return self.text_converter.convert(cached_lyrics)
 
             # 从各个数据源获取歌词
             for source in self.sources:
                 try:
                     lyrics_data = await source.get_lyrics(metadata)
                     if lyrics_data and lyrics_data.get("text"):
+                        lyrics_text = lyrics_data["text"]
+                        # 进行文字转换
+                        converted_lyrics = self.text_converter.convert(lyrics_text)
                         # 保存到缓存
                         await self.media_cache.save_lyrics(
                             artist=metadata.artist,
                             title=metadata.title,
-                            lyrics=lyrics_data["text"],
+                            lyrics=converted_lyrics,
                             source=source.__class__.__name__.lower(),
                             language=lyrics_data.get("language", "unknown")
                         )
                         logger.info(f"成功从 {source.__class__.__name__} 获取歌词")
-                        return lyrics_data["text"]
+                        return converted_lyrics
                 except Exception as e:
                     logger.warning(f"从 {source.__class__.__name__} 获取歌词失败: {str(e)}")
                     continue
@@ -356,6 +449,11 @@ class MusicTagger:
                 logger.warning(f"未找到音乐信息: {filename}")
                 return False
 
+            # 进行文字格式转换
+            metadata.title = self.text_converter.convert(metadata.title)
+            metadata.artist = self.text_converter.convert(metadata.artist)
+            metadata.album = self.text_converter.convert(metadata.album)
+
             # 获取封面和歌词
             cover_data = await self.download_cover_art(metadata)
             lyrics = await self.get_lyrics(metadata)
@@ -380,6 +478,36 @@ class MusicTagger:
                     image.desc = "Cover"
                     image.data = cover_data
                     audio.add_picture(image)
+
+            elif file_path.lower().endswith('.wav'):
+                # WAV 文件使用 ID3 标签
+                from mutagen.wave import WAVE
+                audio = WAVE(file_path)
+                
+                # 如果文件没有 ID3 标签，添加一个
+                if not audio.tags:
+                    from mutagen.id3 import ID3, TIT2, TPE1, TALB, USLT
+                    audio.tags = ID3()
+                
+                # 更新标签
+                audio.tags.add(TIT2(encoding=3, text=metadata.title))
+                audio.tags.add(TPE1(encoding=3, text=metadata.artist))
+                audio.tags.add(TALB(encoding=3, text=metadata.album))
+                
+                # 添加歌词
+                if lyrics:
+                    audio.tags.add(USLT(encoding=3, lang='eng', desc='', text=lyrics))
+                
+                # 添加封面
+                if cover_data:
+                    from mutagen.id3 import APIC
+                    audio.tags.add(APIC(
+                        encoding=3,
+                        mime='image/jpeg',
+                        type=3,  # 封面图片
+                        desc='Cover',
+                        data=cover_data
+                    ))
 
             else:  # MP3 或其他格式
                 audio = File(file_path, easy=True)
@@ -417,38 +545,91 @@ class MusicTagger:
         """递归获取所有音乐文件"""
         music_files = []
         for file_path in directory.rglob("*"):
-            if file_path.is_file() and file_path.suffix.lower() in [".mp3", ".m4a", ".flac"]:
+            if file_path.is_file() and file_path.suffix.lower() in [".mp3", ".m4a", ".flac", ".wav"]:
                 music_files.append(file_path)
         return music_files
 
-    async def _organize_file(self, file_path: str, metadata: MusicMetadata):
+    async def _organize_file(self, file_path: str, metadata: MusicMetadata) -> None:
         """根据元数据整理文件"""
         try:
+            logger.info(f"开始整理文件: {file_path}")
+            logger.info(f"元数据信息: {metadata}")
+            
             source_path = Path(file_path)
-            root_dir = source_path.parent.parent  # 假设当前目录是艺术家目录的父目录
+            if not source_path.exists():
+                logger.error(f"源文件不存在: {source_path}")
+                return
+                
+            # 从配置文件获取目标目录
+            root_dir = Path(self.config.get("directories.target"))
+            # 确保目标目录存在
+            root_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(f"使用目标目录: {root_dir}")
+            
+            # 从配置文件获取目录结构模式
+            dir_pattern = self.config.get("directories.directory_pattern",
+                                      "{artist}/{album}/{track_number}. {title}")
+            logger.info(f"使用目录模式: {dir_pattern}")
+            
+            # 将元数据应用到目录模式
+            dir_parts = {}
+            dir_parts["artist"] = metadata.artist or "Unknown Artist"
+            dir_parts["album"] = metadata.album or "Unknown Album"
+            dir_parts["title"] = metadata.title or os.path.splitext(source_path.name)[0]
+            dir_parts["year"] = getattr(metadata, 'year', '')
+            dir_parts["track_number"] = str(getattr(metadata, 'track_number', '00')).zfill(2)
+            
+            logger.info(f"目录部分信息: {dir_parts}")
             
             # 净化文件名中的非法字符
             def clean_name(name: str) -> str:
                 return re.sub(r'[<>:"/\\|?*]', '_', name)
             
-            artist_dir = root_dir / clean_name(metadata.artist)
-            album_dir = artist_dir / clean_name(metadata.album)
-            new_filename = f"{clean_name(metadata.title)}{source_path.suffix}"
-            target_path = album_dir / new_filename
+            # 净化并替换路径中的变量
+            for key, value in dir_parts.items():
+                dir_parts[key] = self._clean_name(str(value))
             
-            # 创建必要的目录
-            os.makedirs(album_dir, exist_ok=True)
-            
-            # 如果目标文件已存在，添加序号
-            counter = 1
-            while target_path.exists():
-                new_filename = f"{clean_name(metadata.title)}_{counter}{source_path.suffix}"
-                target_path = album_dir / new_filename
-                counter += 1
-            
-            # 移动文件
-            shutil.move(str(source_path), str(target_path))
-            logger.info(f"已将文件整理至: {target_path}")
+            try:
+                # 应用目录结构模式
+                relative_path = dir_pattern.format(**dir_parts)
+                logger.info(f"生成的相对路径: {relative_path}")
+                
+                # 添加原始文件扩展名
+                relative_path = relative_path + source_path.suffix
+                target_path = root_dir / relative_path
+                logger.info(f"完整目标路径: {target_path}")
+                
+                # 创建必要的目录
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                
+                # 如果目标文件已存在，添加序号
+                counter = 1
+                original_target_path = target_path
+                while target_path.exists():
+                    stem = original_target_path.stem
+                    new_filename = f"{stem}_{counter}{source_path.suffix}"
+                    target_path = original_target_path.parent / new_filename
+                    counter += 1
+                
+                # 移动文件
+                logger.info(f"移动文件:\n  从: {source_path}\n  到: {target_path}")
+                shutil.move(str(source_path), str(target_path))
+                logger.info(f"文件移动成功")
+                
+                # 检查并删除空的源目录
+                source_dir = source_path.parent
+                if source_dir.exists() and not any(source_dir.iterdir()):
+                    source_dir.rmdir()
+                    logger.info(f"删除空目录: {source_dir}")
+                    
+            except KeyError as e:
+                logger.error(f"目录结构模式中包含未知变量: {e}")
+            except FileNotFoundError as e:
+                logger.error(f"文件不存在: {e}")
+            except PermissionError as e:
+                logger.error(f"没有足够的权限: {e}")
+            except Exception as e:
+                logger.error(f"移动文件时发生错误: {e}")
             
         except Exception as e:
             logger.error(f"整理文件时出错 {file_path}: {str(e)}")
@@ -457,8 +638,17 @@ class MusicTagger:
         """处理整个目录的音乐文件，支持递归和文件整理"""
         await self.initialize()
         try:
-            directory = Path(directory_path)
-            music_files = self._get_music_files(directory)
+            # 设置日志级别
+            if '--debug' in sys.argv:
+                logging.getLogger().setLevel(logging.DEBUG)
+                
+            root_dir = Path(directory_path)
+            music_files = self._get_music_files(root_dir)
+            logger.debug(f"Found music files: {[str(f) for f in music_files]}")
+            
+            if not music_files:
+                logger.warning(f"在目录 {directory_path} 中未找到音乐文件")
+                return
             
             logger.info(f"找到 {len(music_files)} 个音乐文件")
             
@@ -472,7 +662,12 @@ class MusicTagger:
                     continue
                 
                 # 处理文件
-                metadata = await self.search_track_info(*self.parse_filename(file_path.stem))
+                artist, title = self.parse_filename(file_path.stem)
+                if not title:
+                    logger.warning(f"无法从文件名解析音乐信息: {file_path.name}")
+                    continue
+                
+                metadata = await self.search_track_info(title, artist)
                 if metadata:
                     if await self.process_file(file_path_str):
                         # 更新文件状态
@@ -490,20 +685,51 @@ class MusicTagger:
             # 保存文件状态
             await self.file_status.save_status()
             
+            # 保存状态后完成
+            if organize_files:
+                logger.info("文件整理完成")
+            
         finally:
             await self.close()
+            
+    def _clean_name(self, name: str) -> str:
+        """净化文件名中的非法字符"""
+        # 移除或替换非法字符
+        name = re.sub(r'[<>:"/\\|?*]', '_', name)
+        # 移除首尾空白字符
+        name = name.strip()
+        # 确保名称非空
+        return name if name else "Unknown"
 
 if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="音乐文件自动刮削工具")
-    parser.add_argument("directory", help="要处理的音乐文件夹路径")
     parser.add_argument("--no-organize", action="store_true", help="不整理文件夹结构")
     parser.add_argument("--config", help="配置文件路径")
+    parser.add_argument("--debug", action="store_true", help="启用调试模式")
     args = parser.parse_args()
     
-    # 使用示例
+    # 设置日志级别
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logging.debug("Debug mode enabled")
+    
+    # 创建标签处理器
     tagger = MusicTagger(config_path=args.config)
     
-    # 运行异步主函数
-    asyncio.run(tagger.process_directory(args.directory, organize_files=not args.no_organize))
+    # 从配置文件获取源目录
+    source_dir = tagger.config.get("directories.source")
+    if not source_dir:
+        logger.error("配置文件中未设置源目录路径 (directories.source)")
+        sys.exit(1)
+    
+    # 确保源目录存在
+    if not os.path.exists(source_dir):
+        logger.error(f"源目录不存在: {source_dir}")
+        sys.exit(1)
+    
+    # 运行异步主函数，默认启用文件整理
+    organize = not args.no_organize
+    logging.debug(f"File organization is {'enabled' if organize else 'disabled'}")
+    asyncio.run(tagger.process_directory(source_dir, organize_files=organize))

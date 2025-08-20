@@ -8,6 +8,7 @@ from fuzzywuzzy import fuzz
 
 from .base import MusicSource
 from music_metadata import MusicMetadata
+from .cache_handler import MusicTaggerCacheHandler
 
 logger = logging.getLogger(__name__)
 
@@ -16,10 +17,12 @@ class SpotifySource(MusicSource):
     def __init__(self, client_id: str, client_secret: str, weight: float = 1.0):
         self.weight = weight
         self.session = None
+        cache_handler = MusicTaggerCacheHandler()
         self.sp = spotipy.Spotify(
             auth_manager=SpotifyClientCredentials(
                 client_id=client_id,
-                client_secret=client_secret
+                client_secret=client_secret,
+                cache_handler=cache_handler
             )
         )
         

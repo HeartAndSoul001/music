@@ -9,12 +9,31 @@ logger = logging.getLogger(__name__)
 class Config:
     def __init__(self, config_path: str = None):
         """初始化配置管理器"""
-        self.config_path = config_path or os.path.join(os.path.dirname(__file__), '..', 'config.yaml')
+        if config_path:
+            self.config_path = os.path.abspath(config_path)
+        else:
+            # 获取项目根目录（src的父目录）
+            root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            self.config_path = os.path.join(root_dir, 'config.yaml')
+            
+        logger.debug(f"使用配置文件路径: {self.config_path}")
+        
+        if not os.path.exists(self.config_path):
+            logger.error(f"配置文件不存在: {self.config_path}")
+            example_path = self.config_path + '.example'
+            if os.path.exists(example_path):
+                logger.info(f"请复制 {example_path} 到 {self.config_path} 并进行配置")
+        
         self.config = self._load_config()
 
     def _load_config(self) -> Dict[str, Any]:
         """加载配置文件"""
         default_config = {
+            'directories': {
+                'source': '',
+                'target': '',
+                'directory_pattern': '{artist}/{year} - {album}/{track_number}. {title}'
+            },
             'global': {
                 'min_confidence': 50,
                 'require_confirmation': True,
@@ -65,17 +84,26 @@ class Config:
             # 读取现有配置文件
             with open(self.config_path, 'r', encoding='utf-8') as f:
                 config = yaml.safe_load(f)
+                logger.debug(f"从配置文件加载的内容: {config}")
                 
             if not config:
+                logger.warning("配置文件为空，使用默认配置")
                 return default_config
                 
-            # 合并默认配置和用户配置
-            merged_config = default_config.copy()
-            for key, value in config.items():
-                if isinstance(value, dict) and key in merged_config:
-                    merged_config[key].update(value)
-                else:
-                    merged_config[key] = value
+            # 使用用户配置替换默认配置
+            merged_config = config
+            
+            # 如果directories不存在，添加默认的directories配置
+            if 'directories' not in merged_config:
+                merged_config['directories'] = default_config['directories']
+            
+            # 确保必要的目录配置存在
+            if not merged_config['directories'].get('source'):
+                logger.warning("配置文件中未设置源目录路径 (directories.source)")
+            if not merged_config['directories'].get('target'):
+                logger.warning("配置文件中未设置目标目录路径 (directories.target)")
+            if not merged_config['directories'].get('directory_pattern'):
+                merged_config['directories']['directory_pattern'] = default_config['directories']['directory_pattern']
                     
             return merged_config
             
