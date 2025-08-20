@@ -3,11 +3,7 @@
 # 全局设置
 global:
   min_confidence: 50  # 最小置信度阈值，低于此值的匹配将被忽略
-  require_confirmation: false  # 是否需要用户确认匹配结果
-  skip_scraped: true  # 跳过已刮削的文件
-  organize_library: true  # 启用文件夹整理功能
-  search_timeout: 30  # 搜索超时时间（秒）
-  library_format: "{artist}/{album}/{title}"  # 文件夹组织格式
+  require_confirmation: true  # 是否需要用户确认匹配结果
 
 # MusicBrainz 数据源设置
 musicbrainz:

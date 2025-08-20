@@ -4,7 +4,7 @@ import asyncio
 import nest_asyncio
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Dict, List, Optional, Tuple
 import musicbrainzngs
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
@@ -16,8 +16,10 @@ from tqdm import tqdm
 import aiohttp
 import json
 from concurrent.futures import ThreadPoolExecutor
+import shutil
 
 from music_metadata import MusicMetadata
+from file_status import FileStatus
 from music_sources.base import MusicSource
 from music_sources.netease import NeteaseMusicSource
 from music_sources.qq import QQMusicSource
@@ -34,8 +36,6 @@ logger = logging.getLogger(__name__)
 from config import Config
 from cache import Cache
 from media_cache import MediaCache
-from constants import MUSIC_EXTENSIONS
-from file_manager import FileTracker, LibraryOrganizer
 
 class MusicTagger:
     def __init__(self, config_path: str = None):
@@ -46,11 +46,7 @@ class MusicTagger:
         self.executor = ThreadPoolExecutor(max_workers=4)
         self.cache = Cache()
         self.media_cache = MediaCache()
-        self.file_tracker = FileTracker()
-        self.library_organizer = LibraryOrganizer(
-            library_root=".",  # 默认使用当前目录
-            format_pattern=self.config.get('global.library_format', "{artist}/{album}/{title}")
-        )
+        self.file_status = FileStatus()
     
     def _initialize_sources(self) -> List[MusicSource]:
         """初始化已启用的数据源"""
@@ -60,12 +56,16 @@ class MusicTagger:
         # 初始化 MusicBrainz 数据源
         if self.config.is_source_enabled('musicbrainz'):
             mb_config = self.config.get_source_config('musicbrainz')
-            source = MusicBrainzSource(
-                app_name=mb_config.get('app_name', 'MusicTagger'),
-                version=mb_config.get('version', '1.0'),
-                contact=mb_config.get('contact', 'your@email.com')
-            )
-            sources.append(source)
+            if mb_config.get('app_name') and mb_config.get('contact'):
+                source = MusicBrainzSource(
+                    app_name=mb_config['app_name'],
+                    version=mb_config.get('version', '1.0'),
+                    contact=mb_config['contact']
+                )
+                sources.append(source)
+                logger.info("MusicBrainz 数据源已启用")
+            else:
+                logger.warning("MusicBrainz 配置不完整，已禁用")
         
         # 初始化 Spotify 数据源
         if self.config.is_source_enabled('spotify'):
@@ -76,32 +76,39 @@ class MusicTagger:
                     client_secret=spotify_config['client_secret']
                 )
                 sources.append(source)
+                logger.info("Spotify 数据源已启用")
+            else:
+                logger.warning("Spotify 配置不完整，已禁用")
         
         # 初始化网易云音乐数据源
         if self.config.is_source_enabled('netease'):
             netease_config = self.config.get_source_config('netease')
             if netease_config.get('api_key') and netease_config.get('api_secret'):
                 source = NeteaseMusicSource(
-                    api_key=netease_config.get('api_key'),
-                    api_secret=netease_config.get('api_secret'),
+                    api_key=netease_config['api_key'],
+                    api_secret=netease_config['api_secret'],
                     weight=netease_config.get('weight', 1.0)
                 )
                 sources.append(source)
+                logger.info("网易云音乐数据源已启用")
+            else:
+                logger.warning("网易云音乐配置不完整，已禁用")
         
         # 初始化 QQ 音乐数据源
         if self.config.is_source_enabled('qqmusic'):
             qq_config = self.config.get_source_config('qqmusic')
             if qq_config.get('api_key'):
                 source = QQMusicSource(
-                    api_key=qq_config.get('api_key'),
+                    api_key=qq_config['api_key'],
                     weight=qq_config.get('weight', 1.0)
                 )
                 sources.append(source)
+                logger.info("QQ音乐数据源已启用")
+            else:
+                logger.warning("QQ音乐配置不完整，已禁用")
         
         if not sources:
-            logger.warning("警告：没有可用的数据源！请检查配置文件并启用至少一个数据源。")
-        else:
-            logger.info(f"已启用的数据源: {', '.join(source.__class__.__name__ for source in sources)}")
+            logger.warning("没有可用的数据源，请检查配置")
             
         return sources
         
@@ -339,12 +346,6 @@ class MusicTagger:
     async def process_file(self, file_path: str) -> bool:
         """处理单个音乐文件"""
         try:
-            # 检查文件是否需要处理
-            file_hash = await self.file_tracker._calculate_file_hash(file_path)
-            if self.config.get('global.skip_scraped', True) and self.file_tracker.is_file_tracked(file_path, file_hash):
-                logger.info(f"跳过已处理的文件: {file_path}")
-                return True
-
             # 获取文件名作为搜索依据
             filename = Path(file_path).stem
             artist, title = self.parse_filename(filename)
@@ -354,13 +355,6 @@ class MusicTagger:
             if not metadata:
                 logger.warning(f"未找到音乐信息: {filename}")
                 return False
-
-            # 根据配置决定是否需要用户确认
-            if self.config.get('global.require_confirmation', False):
-                print(f"\n找到匹配: {metadata}")
-                response = input("是否接受这个匹配? [Y/n] ").lower()
-                if response and response != 'y':
-                    return False
 
             # 获取封面和歌词
             cover_data = await self.download_cover_art(metadata)
@@ -412,29 +406,6 @@ class MusicTagger:
 
             # 保存更改
             audio.save()
-            
-            # 记录文件状态
-            self.file_tracker.track_file(file_path, file_hash, {
-                'artist': metadata.artist,
-                'album': metadata.album,
-                'title': metadata.title
-            })
-
-            # 如果启用了文件夹整理功能
-            if self.config.get('global.organize_library', False):
-                src_path = Path(file_path)
-                new_path = await self.library_organizer.organize_file(
-                    src_path,
-                    {
-                        'artist': metadata.artist,
-                        'album': metadata.album,
-                        'title': metadata.title
-                    }
-                )
-                if new_path:
-                    logger.info(f"文件已移动到: {new_path}")
-                    return True
-                
             logger.info(f"成功更新文件: {file_path}")
             return True
 
@@ -442,35 +413,97 @@ class MusicTagger:
             logger.error(f"处理文件时出错 {file_path}: {str(e)}")
             return False
 
-    def _find_music_files(self, directory: Path) -> Set[str]:
-        """递归查找所有音乐文件"""
-        music_files = set()
-        for ext in MUSIC_EXTENSIONS:
-            music_files.update(str(p) for p in directory.rglob(f"*{ext}"))
+    def _get_music_files(self, directory: Path) -> List[Path]:
+        """递归获取所有音乐文件"""
+        music_files = []
+        for file_path in directory.rglob("*"):
+            if file_path.is_file() and file_path.suffix.lower() in [".mp3", ".m4a", ".flac"]:
+                music_files.append(file_path)
         return music_files
 
-    async def process_directory(self, directory_path: str):
-        """处理整个目录的音乐文件"""
+    async def _organize_file(self, file_path: str, metadata: MusicMetadata):
+        """根据元数据整理文件"""
+        try:
+            source_path = Path(file_path)
+            root_dir = source_path.parent.parent  # 假设当前目录是艺术家目录的父目录
+            
+            # 净化文件名中的非法字符
+            def clean_name(name: str) -> str:
+                return re.sub(r'[<>:"/\\|?*]', '_', name)
+            
+            artist_dir = root_dir / clean_name(metadata.artist)
+            album_dir = artist_dir / clean_name(metadata.album)
+            new_filename = f"{clean_name(metadata.title)}{source_path.suffix}"
+            target_path = album_dir / new_filename
+            
+            # 创建必要的目录
+            os.makedirs(album_dir, exist_ok=True)
+            
+            # 如果目标文件已存在，添加序号
+            counter = 1
+            while target_path.exists():
+                new_filename = f"{clean_name(metadata.title)}_{counter}{source_path.suffix}"
+                target_path = album_dir / new_filename
+                counter += 1
+            
+            # 移动文件
+            shutil.move(str(source_path), str(target_path))
+            logger.info(f"已将文件整理至: {target_path}")
+            
+        except Exception as e:
+            logger.error(f"整理文件时出错 {file_path}: {str(e)}")
+
+    async def process_directory(self, directory_path: str, organize_files: bool = True):
+        """处理整个目录的音乐文件，支持递归和文件整理"""
         await self.initialize()
         try:
             directory = Path(directory_path)
-            music_files = self._find_music_files(directory)
-            
-            # 清理不存在的文件记录
-            self.file_tracker.remove_missing_files(music_files)
+            music_files = self._get_music_files(directory)
             
             logger.info(f"找到 {len(music_files)} 个音乐文件")
             
             # 使用异步进度条
-            for file_path in tqdm(sorted(music_files), desc="处理音乐文件"):
-                await self.process_file(str(file_path))
+            for file_path in tqdm(music_files, desc="处理音乐文件"):
+                file_path_str = str(file_path)
+                
+                # 检查文件是否已处理
+                if self.file_status.is_file_processed(file_path_str):
+                    logger.info(f"跳过已处理的文件: {file_path_str}")
+                    continue
+                
+                # 处理文件
+                metadata = await self.search_track_info(*self.parse_filename(file_path.stem))
+                if metadata:
+                    if await self.process_file(file_path_str):
+                        # 更新文件状态
+                        self.file_status.update_file_status(file_path_str, {
+                            "title": metadata.title,
+                            "artist": metadata.artist,
+                            "album": metadata.album,
+                            "source": metadata.source
+                        })
+                        
+                        # 如果需要整理文件
+                        if organize_files:
+                            await self._organize_file(file_path_str, metadata)
+            
+            # 保存文件状态
+            await self.file_status.save_status()
+            
         finally:
             await self.close()
 
 if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="音乐文件自动刮削工具")
+    parser.add_argument("directory", help="要处理的音乐文件夹路径")
+    parser.add_argument("--no-organize", action="store_true", help="不整理文件夹结构")
+    parser.add_argument("--config", help="配置文件路径")
+    args = parser.parse_args()
+    
     # 使用示例
-    tagger = MusicTagger()
-    music_dir = "/Users/wzq/Downloads/2004-七里香"  # 替换为您的音乐文件夹路径
+    tagger = MusicTagger(config_path=args.config)
     
     # 运行异步主函数
-    asyncio.run(tagger.process_directory(music_dir))
+    asyncio.run(tagger.process_directory(args.directory, organize_files=not args.no_organize))
