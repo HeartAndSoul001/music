@@ -61,7 +61,7 @@ qqmusic:
 # 目录设置
 directories:
   source: "/Users/wzq/Downloads/music"    # 原始音乐文件目录
-  target: "/Users/wzq/Documents/workspace/music/music_library"    # 整理后的目标目录
+  target: "/Users/wzq/Downloads/music_library"    # 整理后的目标目录
   directory_pattern: "{artist}/{year} - {album}/{track_number}. {title}"  # 目录结构模式
 
 # 封面设置
